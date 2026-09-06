@@ -121,6 +121,8 @@ inline int GetPipelineParallelSize() { return GlobalEnv::Instance().pipeline_par
 inline int GetVirtualPipelineParallelSize() { return GlobalEnv::Instance().virtual_pipeline_parallel_size(); }
 inline const PipelineLayout& GetPipelineLayout() {return GlobalEnv::Instance().pipeline_layout();}
 inline void InstallPipelineLayout(const PipelineLayout& layout) {
+    layout.Validate();
+    layout.ValidateForCurrentPipelineTransport();
     GlobalEnv::Instance().set_pipeline_layout(layout);
 }
 inline int GetPPRank() {return GlobalEnv::Instance().pp_rank();}

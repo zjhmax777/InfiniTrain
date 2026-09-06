@@ -1,9 +1,11 @@
 #include <chrono>
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <format>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -142,6 +144,62 @@ DEFINE_validator(lr_decay_style,
 void Train(const nn::parallel::Rank &rank) {
     using namespace nn::parallel;
 
+    if (FLAGS_pipeline_parallel == 0 || FLAGS_virtual_pipeline_parallel == 0) {
+        throw PipelineLayoutError(std::format(
+            "pipeline_parallel and virtual_pipeline_parallel must be positive (got {}, {})",
+            FLAGS_pipeline_parallel, FLAGS_virtual_pipeline_parallel));
+    }
+    const auto check_stage_flag = [](const char *name, int stage) {
+        if (stage < -1 || stage >= static_cast<int>(FLAGS_pipeline_parallel)) {
+            throw PipelineLayoutError(std::format(
+                "{}={} is outside valid stage range [-1, {})", name, stage, FLAGS_pipeline_parallel));
+        }
+    };
+    check_stage_flag("pipeline_embedding_stage", FLAGS_pipeline_embedding_stage);
+    check_stage_flag("pipeline_final_norm_stage", FLAGS_pipeline_final_norm_stage);
+    check_stage_flag("pipeline_lm_head_stage", FLAGS_pipeline_lm_head_stage);
+
+    // Validate layout flags before selecting a device or creating process
+    // groups.  This keeps configuration errors catchable even on a CPU-only
+    // host where a PP run would otherwise try to construct a CUDA device.
+    if (!FLAGS_pipeline_layer_partition.empty()) {
+        const auto partition = PipelineLayout::ParseLayerPartition(FLAGS_pipeline_layer_partition);
+        if (static_cast<int>(partition.size()) != static_cast<int>(FLAGS_pipeline_parallel)) {
+            throw PipelineLayoutError(std::format(
+                "stage count mismatch: pipeline_parallel={}, partition_entries={}",
+                FLAGS_pipeline_parallel, partition.size()));
+        }
+        if (FLAGS_virtual_pipeline_parallel != 1) {
+            throw PipelineLayoutError(std::format(
+                "custom layer partition is not supported with vpp_size={}",
+                FLAGS_virtual_pipeline_parallel));
+        }
+    }
+
+    // For randomly initialized models the layer count is known before any
+    // device work, so perform the complete validation (including layer sum)
+    // up front.  Checkpoint-backed models repeat this after reading the header
+    // in LoadFromLLMC, where the authoritative layer count is available.
+    if (FLAGS_llmc_filepath.empty()) {
+        auto preflight_config = gpt2::GPT2Config();
+        if (kModelToConfigs.count(FLAGS_model)) {
+            preflight_config = kModelToConfigs.at(FLAGS_model);
+        }
+        gpt2::SanitizeGPT2Config(preflight_config);
+        SpecialModulePlacement placement{
+            .embedding_stage = FLAGS_pipeline_embedding_stage,
+            .final_norm_stage = FLAGS_pipeline_final_norm_stage,
+            .lm_head_stage = FLAGS_pipeline_lm_head_stage,
+        };
+        auto preflight_layout = PipelineLayout::BuildPipelineLayout(
+            preflight_config.n_layer,
+            static_cast<int>(FLAGS_pipeline_parallel),
+            static_cast<int>(FLAGS_virtual_pipeline_parallel),
+            FLAGS_pipeline_layer_partition,
+            placement);
+        global::InstallPipelineLayout(preflight_layout);
+    }
+
     {
         if (rank.IsLastRank()) {
             if (!FLAGS_save.empty() && FLAGS_save_interval == 0) {
@@ -231,21 +289,13 @@ void Train(const nn::parallel::Rank &rank) {
     } else if (kModelToConfigs.count(FLAGS_model)) {
         model_config = kModelToConfigs.at(FLAGS_model);
         gpt2::SanitizeGPT2Config(model_config);
-        nn::parallel::SpecialModulePlacement placement{
-            .embedding_stage = FLAGS_pipeline_embedding_stage,
-            .final_norm_stage = FLAGS_pipeline_final_norm_stage,
-            .lm_head_stage = FLAGS_pipeline_lm_head_stage,
-        };
-        auto layout = nn::parallel::PipelineLayout::BuildPipelineLayout(
-            model_config.n_layer,
-            static_cast<int>(FLAGS_pipeline_parallel),
-            static_cast<int>(FLAGS_virtual_pipeline_parallel),
-            FLAGS_pipeline_layer_partition,
-            placement);
-        layout.ValidateForCurrentPipelineTransport();
-        nn::parallel::global::InstallPipelineLayout(layout);
+        const auto &layout = nn::parallel::global::GetPipelineLayout();
         if (rank.IsMainRank()) {
             LOG(INFO) << layout.ToString();
+        } else {
+            const auto &local_stage = layout.stage(pp_rank);
+            LOG(INFO) << std::format("Pipeline stage {} owns {} chunk(s)", pp_rank,
+                                     local_stage.global_chunk_ids.size());
         }
         model = std::make_shared<nn::TransformerModel>(model_config);
     }
@@ -596,23 +646,36 @@ int main(int argc, char *argv[]) {
 
     LOG(INFO) << nn::parallel::global::ProcessGroupOverview();
 
+    std::atomic<bool> validation_failed = false;
+    auto train_checked = [&](const nn::parallel::Rank &rank) {
+        try {
+            Train(rank);
+        } catch (const nn::parallel::PipelineLayoutError &error) {
+            validation_failed.store(true);
+            LOG(ERROR) << "PipelineLayoutError: " << error.what();
+        } catch (const std::invalid_argument &error) {
+            validation_failed.store(true);
+            LOG(ERROR) << "InvalidArgument: " << error.what();
+        }
+    };
+
     if (FLAGS_nthread_per_process > 1) {
         std::vector<std::thread> threads;
         for (int idx = 0; idx < FLAGS_nthread_per_process; ++idx) {
             nn::parallel::Rank rank(nn::parallel::global::GetGlobalProcRank(), idx,
                                     nn::parallel::global::GetNprocPerNode(), FLAGS_nthread_per_process);
-            threads.emplace_back(Train, rank);
+            threads.emplace_back(train_checked, rank);
         }
 
         for (auto &thread : threads) { thread.join(); }
     } else {
         nn::parallel::Rank rank(nn::parallel::global::GetGlobalProcRank(), 0, nn::parallel::global::GetNprocPerNode(),
                                 FLAGS_nthread_per_process);
-        Train(rank);
+        train_checked(rank);
     }
 
     gflags::ShutDownCommandLineFlags();
     google::ShutdownGoogleLogging();
 
-    return 0;
+    return validation_failed.load() ? 2 : 0;
 }
