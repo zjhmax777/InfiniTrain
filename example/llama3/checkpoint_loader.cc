@@ -29,6 +29,7 @@ using namespace infini_train;
 namespace nn = infini_train::nn;
 
 DECLARE_string(pipeline_layer_partition);
+DECLARE_string(pipeline_layout);
 DECLARE_int32(pipeline_embedding_stage);
 DECLARE_int32(pipeline_final_norm_stage);
 DECLARE_int32(pipeline_lm_head_stage);
@@ -94,12 +95,16 @@ std::shared_ptr<nn::TransformerModel> LoadFromLLMC(const std::string &filepath) 
         .final_norm_stage = FLAGS_pipeline_final_norm_stage,
         .lm_head_stage = FLAGS_pipeline_lm_head_stage,
     };
-    auto layout = nn::parallel::PipelineLayout::BuildPipelineLayout(
-        static_cast<int>(n_layer),
-        nn::parallel::global::GetPipelineParallelSize(),
-        nn::parallel::global::GetVirtualPipelineParallelSize(),
-        FLAGS_pipeline_layer_partition,
-        placement);
+    auto layout = FLAGS_pipeline_layout.empty()
+        ? nn::parallel::PipelineLayout::BuildPipelineLayout(
+              static_cast<int>(n_layer),
+              nn::parallel::global::GetPipelineParallelSize(),
+              nn::parallel::global::GetVirtualPipelineParallelSize(),
+              FLAGS_pipeline_layer_partition, placement)
+        : nn::parallel::PipelineLayout::ParseMegatronStyleLayout(
+              FLAGS_pipeline_layout, static_cast<int>(n_layer),
+              nn::parallel::global::GetPipelineParallelSize(),
+              nn::parallel::global::GetVirtualPipelineParallelSize(), placement);
     layout.ValidateForCurrentPipelineTransport();
     nn::parallel::global::InstallPipelineLayout(layout);
     auto llama3 = std::make_shared<nn::TransformerModel>(llama3_config);

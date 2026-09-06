@@ -103,6 +103,26 @@ public:
 
     static std::vector<int> ParseLayerPartition(const std::string &value);
 
+    // Parse a Megatron-style layout expression.  Stages are separated by '|',
+    // chunks within a stage by ',', 't' denotes one transformer layer and E/F/H
+    // denote embedding/final-norm/LM-head ownership respectively. Parenthesized
+    // expressions may be repeated with '*N'.
+    static PipelineLayout ParseMegatronStyleLayout(
+        const std::string& value,
+        int num_layers,
+        int pp_size,
+        int vpp_size = 1,
+        SpecialModulePlacement placement = {},
+        PipelineLayoutPolicy policy = {});
+
+    // Suggest a contiguous layer partition that approximately balances the
+    // supplied per-layer costs.  The returned vector has pp_size entries and
+    // sums to num_layers.
+    static std::vector<int> SuggestBalancedPartition(
+        int num_layers,
+        int pp_size,
+        const std::vector<double>& layer_costs = {});
+
     static PipelineLayout BuildPipelineLayout(
         int num_layers,
         int pp_size,

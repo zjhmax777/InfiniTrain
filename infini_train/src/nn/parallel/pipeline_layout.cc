@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <format>
+#include <functional>
 #include <limits>
 #include <sstream>
 #include <unordered_set>
@@ -466,6 +467,193 @@ std::vector<int> PipelineLayout::ParseLayerPartition(const std::string &value) {
         begin = comma + 1;
     }
 
+    return result;
+}
+
+PipelineLayout PipelineLayout::ParseMegatronStyleLayout(
+    const std::string& value,
+    int num_layers,
+    int pp_size,
+    int vpp_size,
+    SpecialModulePlacement placement,
+    PipelineLayoutPolicy policy) {
+    if (value.empty()) Fail("pipeline_layout must not be empty");
+    if (num_layers <= 0 || pp_size <= 0 || vpp_size <= 0) {
+        Fail(std::format("num_layers, pp_size and vpp_size must be positive (got {}, {}, {})",
+                         num_layers, pp_size, vpp_size));
+    }
+
+    // Expand parenthesized repetitions while preserving stage separators.
+    std::function<std::string(std::string_view)> expand = [&](std::string_view input) {
+        std::string out;
+        for (size_t i = 0; i < input.size();) {
+            if (input[i] != '(') {
+                if (input[i] == ')' || input[i] == '*') {
+                    Fail(std::format("pipeline_layout has unexpected '{}' at offset {}", input[i], i));
+                }
+                out.push_back(input[i++]);
+                continue;
+            }
+            size_t depth = 1, j = i + 1;
+            for (; j < input.size() && depth != 0; ++j) {
+                if (input[j] == '(') ++depth;
+                else if (input[j] == ')') --depth;
+            }
+            if (depth != 0) Fail("pipeline_layout has unmatched '('");
+            const std::string inner = expand(input.substr(i + 1, j - i - 2));
+            size_t repeat = 1;
+            if (j < input.size() && input[j] == '*') {
+                size_t k = j + 1;
+                if (k == input.size() || input[k] < '0' || input[k] > '9') {
+                    Fail("pipeline_layout repetition must use *N");
+                }
+                repeat = 0;
+                while (k < input.size() && input[k] >= '0' && input[k] <= '9') {
+                    repeat = repeat * 10 + static_cast<size_t>(input[k++] - '0');
+                    if (repeat > 100000) Fail("pipeline_layout repetition is too large");
+                }
+                if (repeat == 0) Fail("pipeline_layout repetition must be positive");
+                j = k;
+            }
+            for (size_t n = 0; n < repeat; ++n) out += inner;
+            i = j;
+        }
+        return out;
+    };
+
+    const std::string expanded = expand(value);
+    std::vector<std::string> stage_exprs;
+    size_t begin = 0;
+    while (true) {
+        const size_t sep = expanded.find('|', begin);
+        stage_exprs.emplace_back(expanded.substr(begin, sep == std::string::npos
+                                                          ? std::string::npos : sep - begin));
+        if (sep == std::string::npos) break;
+        begin = sep + 1;
+    }
+    if (static_cast<int>(stage_exprs.size()) != pp_size) {
+        Fail(std::format("pipeline_layout stage count mismatch: pp_size={}, stages={}",
+                         pp_size, stage_exprs.size()));
+    }
+
+    std::vector<std::vector<int>> layer_counts(pp_size);
+    bool saw_embedding = false, saw_final_norm = false, saw_lm_head = false;
+    for (int stage_id = 0; stage_id < pp_size; ++stage_id) {
+        const auto& expr = stage_exprs[stage_id];
+        size_t chunk_begin = 0;
+        while (true) {
+            const size_t comma = expr.find(',', chunk_begin);
+            const std::string token = expr.substr(chunk_begin,
+                comma == std::string::npos ? std::string::npos : comma - chunk_begin);
+            int t_count = 0;
+            for (char c : token) {
+                switch (c) {
+                case 't': case 'T': ++t_count; break;
+                case 'E':
+                    if (saw_embedding) Fail("pipeline_layout contains multiple E tokens");
+                    placement.embedding_stage = stage_id; saw_embedding = true; break;
+                case 'F':
+                    if (saw_final_norm) Fail("pipeline_layout contains multiple F tokens");
+                    placement.final_norm_stage = stage_id; saw_final_norm = true; break;
+                case 'H': case 'L':
+                    if (saw_lm_head) Fail("pipeline_layout contains multiple H/L tokens");
+                    placement.lm_head_stage = stage_id; saw_lm_head = true; break;
+                case ' ': case '\t': case '\n': case '\r':
+                    Fail("pipeline_layout does not allow whitespace");
+                default:
+                    Fail(std::format("pipeline_layout contains unknown symbol '{}'", c));
+                }
+            }
+            layer_counts[stage_id].push_back(t_count);
+            if (comma == std::string::npos) break;
+            chunk_begin = comma + 1;
+        }
+        if (static_cast<int>(layer_counts[stage_id].size()) != vpp_size) {
+            Fail(std::format(
+                "pipeline_layout chunk count mismatch at stage {}: vpp_size={}, chunks={}",
+                stage_id, vpp_size, layer_counts[stage_id].size()));
+        }
+    }
+
+    // Global execution order is chunk-major: all stages of local chunk 0,
+    // followed by all stages of local chunk 1, matching the existing
+    // interleaved scheduler's global chunk numbering.
+    std::vector<ChunkLayout> chunks;
+    chunks.reserve(static_cast<size_t>(pp_size) * static_cast<size_t>(vpp_size));
+    int layer_cursor = 0;
+    for (int local_chunk_id = 0; local_chunk_id < vpp_size; ++local_chunk_id) {
+        for (int stage_id = 0; stage_id < pp_size; ++stage_id) {
+            const int count = layer_counts[stage_id][local_chunk_id];
+            const int global_chunk_id = local_chunk_id * pp_size + stage_id;
+            chunks.push_back(ChunkLayout{.global_chunk_id = global_chunk_id,
+                                         .stage_id = stage_id,
+                                         .local_chunk_id = local_chunk_id,
+                                         .layers = LayerRange{layer_cursor, layer_cursor + count}});
+            layer_cursor += count;
+        }
+    }
+    if (layer_cursor != num_layers) {
+        Fail(std::format("pipeline_layout layer count mismatch: num_layers={}, parsed_layers={}",
+                         num_layers, layer_cursor));
+    }
+    if (!saw_embedding) placement.embedding_stage = 0;
+    if (!saw_final_norm) placement.final_norm_stage = pp_size - 1;
+    if (!saw_lm_head) placement.lm_head_stage = pp_size - 1;
+    // Explicit layouts may intentionally contain empty stages; retain them for
+    // inspection and let transport validation decide whether they are runnable.
+    for (const auto& c : chunks) if (c.layers.size() == 0) policy.allow_empty_stages = true;
+    return PipelineLayout(num_layers, pp_size, vpp_size, std::move(chunks),
+                          BuildPlacement(placement, pp_size), policy);
+}
+
+std::vector<int> PipelineLayout::SuggestBalancedPartition(
+    int num_layers, int pp_size, const std::vector<double>& layer_costs) {
+    if (num_layers <= 0 || pp_size <= 0) {
+        Fail(std::format("num_layers and pp_size must be positive (got {}, {})",
+                         num_layers, pp_size));
+    }
+    if (num_layers < pp_size) {
+        Fail(std::format("num_layers={} is smaller than pp_size={}", num_layers, pp_size));
+    }
+    std::vector<double> costs = layer_costs;
+    if (costs.empty()) costs.assign(static_cast<size_t>(num_layers), 1.0);
+    if (static_cast<int>(costs.size()) != num_layers) {
+        Fail(std::format("layer_costs length mismatch: num_layers={}, costs={}",
+                         num_layers, costs.size()));
+    }
+    for (int i = 0; i < num_layers; ++i) {
+        if (!std::isfinite(costs[i]) || costs[i] < 0.0) {
+            Fail(std::format("layer_costs[{}] must be finite and non-negative", i));
+        }
+    }
+    double total = 0.0;
+    for (double c : costs) total += c;
+    std::vector<int> result;
+    result.reserve(pp_size);
+    int cursor = 0;
+    double remaining = total;
+    for (int stage = 0; stage < pp_size - 1; ++stage) {
+        const int layers_left = num_layers - cursor;
+        const int stages_left = pp_size - stage;
+        const double target = remaining / static_cast<double>(stages_left);
+        int take = 1;
+        double accum = costs[cursor];
+        while (take < layers_left - (stages_left - 1) &&
+               accum + costs[cursor + take] <= target) {
+            accum += costs[cursor + take++];
+        }
+        // If the next layer gets us closer to the target, include it; a heavy
+        // layer is consequently isolated instead of being paired blindly.
+        if (take < layers_left - (stages_left - 1) &&
+            std::abs(accum + costs[cursor + take] - target) <
+                std::abs(accum - target)) {
+            accum += costs[cursor + take++];
+        }
+        result.push_back(take);
+        cursor += take;
+        remaining -= accum;
+    }
+    result.push_back(num_layers - cursor);
     return result;
 }
 
