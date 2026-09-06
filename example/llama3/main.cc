@@ -84,6 +84,10 @@ DEFINE_uint32(tensor_parallel, 1, "Tensor Parallel world size");
 DEFINE_bool(sequence_parallel, false, "Whether to enable Sequence Parallel");
 DEFINE_uint32(pipeline_parallel, 1, "Pipeline Parallel world size, specified the number of PP stages.");
 DEFINE_uint32(virtual_pipeline_parallel, 1, "Number of chunks in PP stage.");
+DEFINE_string(pipeline_layer_partition, "", "Comma-separated layer counts per PP stage, e.g. 4,8,6,6");
+DEFINE_int32(pipeline_embedding_stage, 0, "Stage that owns embedding.");
+DEFINE_int32(pipeline_final_norm_stage, -1, "Stage that owns final norm; -1 means last PP stage.");
+DEFINE_int32(pipeline_lm_head_stage, -1, "Stage that owns LM head; -1 means last PP stage.");
 // precision
 DEFINE_string(dtype, "float32", "precision used in training (float32/bfloat16)");
 DEFINE_uint32(save_interval, 0, "save checkpoint every N steps; 0 disables saving");
@@ -214,6 +218,22 @@ void Train(const nn::parallel::Rank &rank) {
         model = llama3::LoadFromLLMC(FLAGS_llmc_filepath);
     } else {
         llama3::SanitizeLLaMA3Config(model_config);
+        nn::parallel::SpecialModulePlacement placement{
+            .embedding_stage = FLAGS_pipeline_embedding_stage,
+            .final_norm_stage = FLAGS_pipeline_final_norm_stage,
+            .lm_head_stage = FLAGS_pipeline_lm_head_stage,
+        };
+        auto layout = nn::parallel::PipelineLayout::BuildPipelineLayout(
+            model_config.n_layer,
+            static_cast<int>(FLAGS_pipeline_parallel),
+            static_cast<int>(FLAGS_virtual_pipeline_parallel),
+            FLAGS_pipeline_layer_partition,
+            placement);
+        layout.ValidateForCurrentPipelineTransport();
+        nn::parallel::global::InstallPipelineLayout(layout);
+        if (rank.IsMainRank()) {
+            LOG(INFO) << layout.ToString();
+        }
         model = std::make_shared<nn::TransformerModel>(model_config);
     }
 

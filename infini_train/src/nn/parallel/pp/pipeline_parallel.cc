@@ -5,8 +5,11 @@
 #include <memory>
 #include <string>
 
+#include "glog/logging.h"
 #include "infini_train/include/nn/modules/container.h"
 #include "infini_train/include/nn/modules/module.h"
+#include "infini_train/include/nn/parallel/global.h"
+#include "infini_train/include/nn/parallel/pipeline_layout.h"
 #include "infini_train/include/nn/parallel/pp/pipeline_schedule.h"
 #include "infini_train/include/nn/parallel/pp/pipeline_stage.h"
 
@@ -78,21 +81,30 @@ StageInfo PipelineParallel::GetStageInfo(int total_layers, int pp_size, int rank
 
 PipelineParallel::PipelineParallel(const std::shared_ptr<Module> module, int num_stages, int num_micro_batches,
                                    const std::vector<std::vector<int64_t>> &recv_shape, int pp_rank, Device device,
-                                   int chunk_size)
+                                   int vpp)
     : num_stages_(num_stages), rank_(pp_rank) {
     modules_[kModuleName] = std::move(module);
 
-    int stage_id = pp_rank;
-    int stage_size = num_stages;
+    const auto &layout = global::GetPipelineLayout();
+    const auto &stage = layout.stage(rank_);
+    const int num_local_chunks = static_cast<int>(stage.global_chunk_ids.size());
 
     std::vector<std::shared_ptr<Module>> chunks;
-    for (int chunk_id = 0; chunk_id < chunk_size; ++chunk_id) {
+    chunks.reserve(num_local_chunks);
+
+    const bool owns_embedding = layout.owns(SpecialModule::kEmbedding, rank_);
+    const bool owns_final_norm = layout.owns(SpecialModule::kFinalNorm, rank_);
+    const bool owns_lm_head = layout.owns(SpecialModule::kLMHead, rank_);
+    const bool stages_last_module = owns_final_norm || owns_lm_head;
+
+    for (int local_chunk_idx = 0; local_chunk_idx < num_local_chunks; ++local_chunk_idx) {
         std::vector<std::shared_ptr<Module>> chunk_parts;
-        if (chunk_id == 0 && stage_id == 0) {
+        if (local_chunk_idx == 0 && owns_embedding) {
             chunk_parts.push_back(module->mutable_module(kPPFirstStageName));
         }
-        chunk_parts.push_back(module->mutable_module(kPPChunkNamePrefix + std::to_string(chunk_id)));
-        if (chunk_id == chunk_size - 1 && stage_id == stage_size - 1) {
+
+        chunk_parts.push_back(module->mutable_module(kPPChunkNamePrefix + std::to_string(local_chunk_idx)));
+        if (local_chunk_idx == num_local_chunks - 1 && stages_last_module) {
             chunk_parts.push_back(module->mutable_module(kPPLastStageName));
         }
         chunks.push_back(std::make_shared<Sequential>(std::move(chunk_parts)));

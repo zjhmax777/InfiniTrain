@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "gflags/gflags.h"
 #include "glog/logging.h"
 
 #include "infini_train/include/nn/modules/normalization.h"
@@ -17,6 +18,7 @@
 #include "infini_train/include/nn/modules/transformer/mlp.h"
 #include "infini_train/include/nn/modules/transformer/transformer.h"
 #include "infini_train/include/nn/parallel/global.h"
+#include "infini_train/include/nn/parallel/pp/pipeline_parallel.h"
 #include "infini_train/include/nn/parallel/tensor_parallel.h"
 #include "infini_train/include/tensor.h"
 
@@ -25,6 +27,11 @@
 
 using namespace infini_train;
 namespace nn = infini_train::nn;
+
+DECLARE_string(pipeline_layer_partition);
+DECLARE_int32(pipeline_embedding_stage);
+DECLARE_int32(pipeline_final_norm_stage);
+DECLARE_int32(pipeline_lm_head_stage);
 
 namespace {
 constexpr int kRandomSeed = 42;
@@ -82,6 +89,19 @@ std::shared_ptr<nn::TransformerModel> LoadFromLLMC(const std::string &filepath) 
     llama3_config.norm_eps = norm_eps;
     llama3_config.max_gen_batch_size = max_gen_bs;
     llama3::SanitizeLLaMA3Config(llama3_config);
+    nn::parallel::SpecialModulePlacement placement{
+        .embedding_stage = FLAGS_pipeline_embedding_stage,
+        .final_norm_stage = FLAGS_pipeline_final_norm_stage,
+        .lm_head_stage = FLAGS_pipeline_lm_head_stage,
+    };
+    auto layout = nn::parallel::PipelineLayout::BuildPipelineLayout(
+        static_cast<int>(n_layer),
+        nn::parallel::global::GetPipelineParallelSize(),
+        nn::parallel::global::GetVirtualPipelineParallelSize(),
+        FLAGS_pipeline_layer_partition,
+        placement);
+    layout.ValidateForCurrentPipelineTransport();
+    nn::parallel::global::InstallPipelineLayout(layout);
     auto llama3 = std::make_shared<nn::TransformerModel>(llama3_config);
 
     // ========== pp_size：num_stages; vpp_size: num_chunks_per_stage ==========
@@ -330,7 +350,8 @@ std::shared_ptr<nn::TransformerModel> LoadFromLLMC(const std::string &filepath) 
             auto &ln_f
                 = state_dict[std::format("{}.{}.{}", nn::TransformerModel::kTransformerModelName,
                                          nn::TransformerLastStage::kLnFLayerName, nn::RMSNorm::kParamWeightName)];
-            auto &lm_head = state_dict[std::format("{}.{}", nn::TransformerLastStage::kLMHeadLayerName,
+            auto &lm_head = state_dict[std::format("{}.{}.{}", nn::TransformerModel::kTransformerModelName,
+                                                   nn::TransformerLastStage::kLMHeadLayerName,
                                                    nn::parallel::ColumnParallelLinear::kParamWeightName)];
             ReadVectorAllFloat(ifs, static_cast<float *>(ln_f->DataPtr()), n_embd);
             ReadMatrixRowShardFloat(ifs, static_cast<float *>(lm_head->DataPtr()),

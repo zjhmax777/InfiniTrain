@@ -10,6 +10,7 @@
 #include <tuple>
 #include <vector>
 
+#include "gflags/gflags.h"
 #include "glog/logging.h"
 
 #include "infini_train/include/nn/modules/normalization.h"
@@ -27,6 +28,11 @@
 
 using namespace infini_train;
 namespace nn = infini_train::nn;
+
+DECLARE_string(pipeline_layer_partition);
+DECLARE_int32(pipeline_embedding_stage);
+DECLARE_int32(pipeline_final_norm_stage);
+DECLARE_int32(pipeline_lm_head_stage);
 
 namespace {
 constexpr int kRandomSeed = 42;
@@ -89,6 +95,19 @@ std::shared_ptr<nn::TransformerModel> LoadFromLLMC(const std::string &filepath) 
     gpt2_config.n_head = n_head;
     gpt2_config.n_embd = n_embd;
     gpt2::SanitizeGPT2Config(gpt2_config);
+    nn::parallel::SpecialModulePlacement placement{
+        .embedding_stage = FLAGS_pipeline_embedding_stage,
+        .final_norm_stage = FLAGS_pipeline_final_norm_stage,
+        .lm_head_stage = FLAGS_pipeline_lm_head_stage,
+    };
+    auto layout = nn::parallel::PipelineLayout::BuildPipelineLayout(
+        static_cast<int>(n_layer),
+        nn::parallel::global::GetPipelineParallelSize(),
+        nn::parallel::global::GetVirtualPipelineParallelSize(),
+        FLAGS_pipeline_layer_partition,
+        placement);
+    layout.ValidateForCurrentPipelineTransport();
+    nn::parallel::global::InstallPipelineLayout(layout);
     auto local_gpt2 = std::make_shared<nn::TransformerModel>(gpt2_config);
 
     LOG(INFO) << "magic: " << magic << " version: " << version << " block_size: " << block_size
@@ -137,7 +156,8 @@ std::shared_ptr<nn::TransformerModel> LoadFromLLMC(const std::string &filepath) 
         ReadMatrixRowShardFloat(ifs, static_cast<float *>(transformer_wte_weight->DataPtr()), model_vocab_size, n_embd,
                                 v_start, vpp);
     } else if (pp_size > 1 && is_last_stage) {
-        auto &lm_head_weight = state_dict[std::format("{}.{}", nn::TransformerLastStage::kLMHeadLayerName,
+        auto &lm_head_weight = state_dict[std::format("{}.{}.{}", nn::TransformerModel::kTransformerModelName,
+                                                      nn::TransformerLastStage::kLMHeadLayerName,
                                                       nn::parallel::ColumnParallelLinear::kParamWeightName)];
         ReadMatrixRowShardFloat(ifs, static_cast<float *>(lm_head_weight->DataPtr()), model_vocab_size, n_embd, v_start,
                                 vpp);
